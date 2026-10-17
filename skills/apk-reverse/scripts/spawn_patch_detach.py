@@ -55,7 +55,11 @@ import time
 try:
     import frida
 except ImportError:  # keep --help working on a machine without frida
-    frida = None
+    # The optional-dependency idiom this repository uses (see vmp_diff_harness.py): the name is
+    # rebound to None so the caller can test for it. mypy objects because `frida` is now "may be
+    # None", which is exactly the truth the `if frida is None` guard below relies on -- say so
+    # rather than narrow the type.
+    frida = None  # type: ignore[assignment]
 
 DEFAULT_ADB = "adb"
 
