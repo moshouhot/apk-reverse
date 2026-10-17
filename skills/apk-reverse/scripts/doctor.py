@@ -117,16 +117,85 @@ def which(name):
     return _PROBE.which(name)
 
 
-def run(cmd, timeout=15):
-    """Run a command, returning (rc, stdout+stderr). Never raises, always bounded."""
+def _shebang_interpreter(path):
+    """The interpreter named on line 1 of a script, when it exists. '' otherwise.
+
+    A `readelf.PY` installed by pip (pyelftools) is not a PE image, so CreateProcess
+    refuses it with WinError 193. Its shebang names the interpreter that does have the
+    library, which is the whole point of the shim.
+    """
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=timeout)
+        with open(path, 'rb') as fh:
+            first = fh.readline(512)
+    except OSError:
+        return ''
+    if not first.startswith(b'#!'):
+        return ''
+    try:
+        line = first[2:].decode('utf-8', 'replace').strip()
+    except Exception:  # pragma: no cover - decode with 'replace' does not raise
+        return ''
+    # Only an absolute path is usable; `#!/usr/bin/env python` is not resolvable on Windows.
+    return line if os.path.isabs(line) and os.path.isfile(line) else ''
+
+
+def _windows_argv(cmd):
+    """Rewrite argv[0] to something CreateProcess can actually start.
+
+    Measured on this host (Python 3.13, os.name == 'nt'):
+
+      * `subprocess.run(['apktool', ...])` raises FileNotFoundError. There is no
+        PATHEXT search -- `shell=False` calls CreateProcess, which appends only
+        `.exe`, and never `.bat`/`.cmd`. apktool, jadx and apksigner all ship as
+        `.BAT` shims, so the probe reported `exit 127: not found` for three tools
+        that work. The report lied in the pessimistic direction, which is the same
+        defect as reporting a missing tool as present, reversed.
+      * a resolved `.BAT`/`.CMD` path *is* accepted, by CreateProcess through
+        cmd.exe. An earlier draft wrapped these in `cmd /c`, which is both
+        unnecessary and a hazard: a bat that calls another bat without `call`
+        (jadx's does) never returns under `cmd /c`.
+      * a `.PY` is not a PE image: CreateProcess rejects it with WinError 193.
+        Run it through the interpreter from its own shebang instead.
+
+    Only argv[0] is touched. Device commands keep the bare `adb` the capability
+    registry hands them, and no argument is exposed to shell expansion of `$`, `|`,
+    `>` or `;` -- the property the repository's integration test exists to protect.
+    """
+    if os.name != 'nt' or not cmd:
+        return list(cmd)
+    exe = cmd[0]
+    if os.path.isabs(exe) or os.sep in exe or '/' in exe:
+        resolved = exe if os.path.isfile(exe) else (which(exe) or exe)
+    else:
+        resolved = which(exe)
+    if not resolved:
+        return list(cmd)
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext in ('.py', '.pyw'):
+        interp = _shebang_interpreter(resolved) or sys.executable
+        return [interp, resolved] + list(cmd[1:])
+    return [resolved] + list(cmd[1:])
+
+
+def run(cmd, timeout=15):
+    """Run a command, returning (rc, stdout+stderr). Never raises, always bounded.
+
+    argv[0] is resolved to a real executable first: see `_windows_argv` for why a bare
+    name is not enough on Windows and what that cost the report.
+    """
+    try:
+        p = subprocess.run(_windows_argv(cmd), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout)
         return p.returncode, p.stdout.decode('utf-8', 'replace').strip()
     except FileNotFoundError:
         return 127, 'not found'
     except subprocess.TimeoutExpired:
         return 124, 'TIMEOUT after %ss' % timeout
+    except OSError as e:
+        # WinError 193 (`%1 is not a valid Win32 application`) lands here rather than in
+        # the FileNotFoundError branch, and reporting it as an empty success would be a
+        # worse lie than reporting it as missing.
+        return 126, '%s: %s' % (type(e).__name__, e)
     except Exception as e:  # pragma: no cover
         return 1, '%s: %s' % (type(e).__name__, e)
 
